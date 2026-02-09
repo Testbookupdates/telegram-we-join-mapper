@@ -16,7 +16,7 @@ const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHANNEL_ID,
   WEBENGAGE_LICENSE_CODE,
-  WEBENGAGE_API_KEY,
+  WEBENGAGE_API_KEY, 
   STORE_API_KEY,
   FIRE_JOIN_EVENT = "true",
   PORT = 8080,
@@ -26,7 +26,6 @@ const SHOULD_FIRE_JOIN_EVENT = FIRE_JOIN_EVENT.toLowerCase() === "true";
 
 // ================= DB =================
 const db = new Firestore();
-
 const COL_TXN = "txn_invites";
 const COL_INV = "invite_lookup";
 const COL_ORPHAN = "orphan_joins";
@@ -41,11 +40,17 @@ function hashInviteLink(inviteLink) {
 
 // ================= WEBENGAGE =================
 async function webengageFireEvent({ userId, eventName, eventData }) {
-  // FIX: Using the India Region endpoint explicitly
+  /**
+   * FIX: Most Indian accounts MUST use .in 
+   * If you are a Global user, change this back to api.webengage.com
+   */
   const url = `https://api.in.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
 
+  // Clean the API Key (Removes accidental spaces/newlines from copy-paste)
+  const cleanApiKey = (WEBENGAGE_API_KEY || "").trim();
+
   const payload = {
-    userId: String(userId), // Namespaced ID (e.g., pass_123)
+    userId: String(userId), 
     eventName,
     eventTime: unixSeconds(),
     eventData,
@@ -56,15 +61,18 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${WEBENGAGE_API_KEY}`,
+        "Authorization": `Bearer ${cleanApiKey}`,
       },
       body: JSON.stringify(payload),
     });
 
     const body = await res.text();
-    console.log(`[WebEngage] ${eventName} | Status: ${res.status} | Body: ${body}`);
+    
+    // Log helpful debugging info (Masking the key for safety)
+    console.log(`[WebEngage] ${eventName} | Status: ${res.status} | Payload: ${JSON.stringify(payload)}`);
+    console.log(`[WebEngage Response] ${body}`);
 
-    if (!res.ok) throw new Error(body);
+    if (!res.ok) throw new Error(`WE Auth/Endpoint Error: ${res.status} - ${body}`);
   } catch (err) {
     console.error(`[WebEngage Failure] ${eventName}: ${err.message}`);
   }
@@ -80,7 +88,7 @@ async function telegramCreateInviteLink(channelId, name) {
       body: JSON.stringify({
         chat_id: channelId,
         member_limit: 1,
-        expire_date: unixSeconds() + 48 * 60 * 60, // 48h expiry
+        expire_date: unixSeconds() + 48 * 60 * 60,
         name: name.slice(0, 255),
       }),
     }
@@ -127,17 +135,17 @@ app.post("/create-invite", async (req, res) => {
         .commit();
     }
 
-    // Fire-and-forget analytics (don't wait for WE to respond to finish the API call)
+    // Fire event (Non-blocking)
     webengageFireEvent({
-      userId: `pass_${userId}`, // Namespacing for clean segmentation
+      userId: `pass_${userId}`,
       eventName: "pass_paid_community_telegram_link_created",
       eventData: { transactionId, inviteLink, reused },
-    }).catch(e => console.error("WE Link Event Error:", e.message));
+    }).catch(e => console.error("Event Track Fail:", e.message));
 
     res.json({ ok: true, inviteLink, reused });
   } catch (e) {
-    console.error("Create-Invite Error:", e);
-    res.status(500).json({ ok: false });
+    console.error("Link Creation Error:", e);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -160,7 +168,7 @@ app.post("/telegram-webhook", async (req, res) => {
     const invSnap = await db.collection(COL_INV).doc(invHash).get();
 
     if (!invSnap.exists) {
-      await db.collection(COL_ORPHAN).add({ inviteLink, telegramUserId, createdAt: nowIso(), reason: "Not in DB" });
+      await db.collection(COL_ORPHAN).add({ inviteLink, telegramUserId, createdAt: nowIso() });
       return res.send("orphan");
     }
 
@@ -181,14 +189,14 @@ app.post("/telegram-webhook", async (req, res) => {
         userId: `pass_${userId}`,
         eventName: "pass_paid_community_telegram_joined",
         eventData: { transactionId, inviteLink, telegramUserId },
-      }).catch(e => console.error("WE Join Event Error:", e.message));
+      }).catch(e => console.error("Event Track Fail:", e.message));
     }
 
     res.send("ok");
   } catch (e) {
     console.error("Webhook Error:", e);
-    res.status(200).send("ok"); // Always 200 to Telegram
+    res.status(200).send("ok");
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Bridge Online on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 API active on port ${PORT}`));
