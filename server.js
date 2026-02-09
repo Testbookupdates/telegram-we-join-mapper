@@ -15,9 +15,9 @@ app.use(express.json({ limit: "1mb" }));
 const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHANNEL_ID,
-  WEBENGAGE_LICENSE_CODE, // e.g., ~1234abcd
-  WEBENGAGE_API_KEY,      // e.g., 00000000-0000-0000-0000-000000000000
-  STORE_API_KEY,          // Shared secret between WebEngage and this server
+  WEBENGAGE_LICENSE_CODE,
+  WEBENGAGE_API_KEY,      
+  STORE_API_KEY,          
   FIRE_JOIN_EVENT = "true",
   PORT = 8080,
 } = process.env;
@@ -40,16 +40,18 @@ function hashInviteLink(inviteLink) {
 
 // ============= WEBENGAGE API =============
 async function webengageFireEvent({ userId, eventName, eventData }) {
-  // Use .in region for Indian accounts (most common)
-  const url = `https://api.in.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
+  /**
+   * NOTE: If you continue to get 401 and your dashboard URL is dashboard.webengage.com,
+   * change "api.in.webengage.com" to "api.webengage.com"
+   */
+  const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
 
-  // Trim key to remove accidental newline or space characters
   const cleanKey = (WEBENGAGE_API_KEY || "").trim();
 
   const payload = {
-    userId: String(userId),     // Force String ID
+    userId: String(userId),
     eventName,
-    eventTime: unixSeconds(),   // FIX: Mandatory UNIX seconds integer
+    eventTime: unixSeconds(),
     eventData,
   };
 
@@ -58,15 +60,13 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // FIX: WebEngage Event API expects the raw key without "Bearer " prefix
+        // FIX: Removed "Bearer " prefix. WebEngage needs only the raw API Key.
         "Authorization": cleanKey, 
       },
       body: JSON.stringify(payload),
     });
 
     const body = await res.text();
-    
-    // Detailed logging for debugging
     console.log(`[WebEngage] ${eventName} | HTTP ${res.status} | Resp: ${body}`);
 
     if (!res.ok) throw new Error(`WE Error ${res.status}: ${body}`);
@@ -84,8 +84,8 @@ async function telegramCreateInviteLink(channelId, name) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: channelId,
-      member_limit: 1, // Single-use link
-      expire_date: unixSeconds() + (48 * 60 * 60), // 48-hour validity
+      member_limit: 1,
+      expire_date: unixSeconds() + (48 * 60 * 60),
       name: String(name).slice(0, 255),
     }),
   });
@@ -99,13 +99,8 @@ async function telegramCreateInviteLink(channelId, name) {
 
 app.get("/healthz", (_, res) => res.status(200).send("ok"));
 
-/**
- * 1) CREATE INVITE
- * WebEngage triggers this. Creates link & fires link_created event.
- */
 app.post("/create-invite", async (req, res) => {
   try {
-    // API Key Protection
     if (req.header("x-api-key") !== STORE_API_KEY) {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
@@ -119,7 +114,6 @@ app.post("/create-invite", async (req, res) => {
 
     let inviteLink, reused = false;
 
-    // Idempotency: Return existing link if already generated
     if (snap.exists && snap.data().inviteLink) {
       inviteLink = snap.data().inviteLink;
       reused = true;
@@ -137,9 +131,8 @@ app.post("/create-invite", async (req, res) => {
         .commit();
     }
 
-    // Fire-and-forget Link Created Event
     webengageFireEvent({
-      userId: `pass_${userId}`, // Namespacing
+      userId: `pass_${userId}`,
       eventName: "pass_paid_community_telegram_link_created",
       eventData: { transactionId, inviteLink, reused },
     }).catch(e => console.error("Async Event Error:", e.message));
@@ -151,10 +144,6 @@ app.post("/create-invite", async (req, res) => {
   }
 });
 
-/**
- * 2) TELEGRAM WEBHOOK
- * Listens for new members and confirms join.
- */
 app.post("/telegram-webhook", async (req, res) => {
   try {
     const body = req.body || {};
@@ -203,4 +192,4 @@ app.post("/telegram-webhook", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Telegram ↔ WebEngage Mapper running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Final API listening on port ${PORT}`));
