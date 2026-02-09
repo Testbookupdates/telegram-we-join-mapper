@@ -26,7 +26,6 @@ const SHOULD_FIRE_JOIN_EVENT = FIRE_JOIN_EVENT.toLowerCase() === "true";
 
 const db = new Firestore();
 
-// Firestore Collection Names
 const COL_TXN = "txn_invites";    
 const COL_INV = "invite_lookup";  
 const COL_ORPHAN = "orphan_joins"; 
@@ -42,10 +41,11 @@ function hashInviteLink(inviteLink) {
 // ============= EXTERNAL APIS =============
 
 /**
- * Sends custom events to WebEngage (Global API Endpoint)
+ * Sends custom events to WebEngage
  */
 async function webengageFireEvent({ userId, eventName, eventData }) {
-  // Global API endpoint as requested
+  // Try the global endpoint first. If your dashboard is dashboard.in.webengage.com,
+  // change this URL to: https://api.in.webengage.com/v1/accounts/...
   const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
   
   const payload = {
@@ -54,6 +54,8 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
     eventTime: getUnixTimeSeconds(),
     eventData
   };
+
+  console.log(`[WebEngage Payload Check] Sending for User: ${userId} | Event: ${eventName}`);
 
   try {
     const res = await fetch(url, {
@@ -66,16 +68,16 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
     });
 
     const body = await res.text();
-    console.log(`[WebEngage] ${eventName} | Status: ${res.status} | Response: ${body}`);
+    console.log(`[WebEngage Response] Status: ${res.status} | Body: ${body}`);
     return res.ok;
   } catch (err) {
-    console.error(`[WebEngage Failure] ${eventName}: ${err.message}`);
+    console.error(`[WebEngage Error] ${eventName}: ${err.message}`);
     return false;
   }
 }
 
 /**
- * Creates a single-use Telegram invite link valid for 48 hours
+ * Creates a single-use Telegram invite link
  */
 async function telegramCreateInviteLink(channelId, name) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createChatInviteLink`;
@@ -103,9 +105,6 @@ async function telegramCreateInviteLink(channelId, name) {
 
 app.get("/healthz", (_, res) => res.status(200).send("ok"));
 
-/**
- * 1. POST /create-invite
- */
 app.post("/create-invite", async (req, res) => {
   try {
     const apiKey = req.header("x-api-key");
@@ -158,9 +157,6 @@ app.post("/create-invite", async (req, res) => {
   }
 });
 
-/**
- * 2. POST /telegram-webhook
- */
 app.post("/telegram-webhook", async (req, res) => {
   try {
     const body = req.body || {};
@@ -211,4 +207,6 @@ app.post("/telegram-webhook", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Bridge Online on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Bridge Online on port ${PORT}`);
+});
