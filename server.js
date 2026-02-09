@@ -18,35 +18,26 @@ const {
   WEBENGAGE_LICENSE_CODE,
   WEBENGAGE_API_KEY,
   STORE_API_KEY,
-  FIRE_JOIN_EVENT = "true",
   PORT = 8080,
 } = process.env;
 
-const SHOULD_FIRE_JOIN_EVENT = FIRE_JOIN_EVENT.toLowerCase() === "true";
-
 const db = new Firestore();
 
-// Firestore Collection Names
 const COL_TXN = "txn_invites";    
 const COL_INV = "invite_lookup";  
-const COL_ORPHAN = "orphan_joins"; 
 
 // ============= HELPERS =============
-const nowIso = () => new Date().toISOString();
 const getUnixTimeSeconds = () => Math.floor(Date.now() / 1000);
-
-function hashInviteLink(inviteLink) {
-  return crypto.createHash("sha256").update(String(inviteLink || "")).digest("hex");
-}
+const hashInviteLink = (link) => crypto.createHash("sha256").update(String(link || "")).digest("hex");
 
 // ============= EXTERNAL APIS =============
 
 /**
- * Sends custom events to WebEngage (India Region Endpoint)
+ * Sends custom events to WebEngage
  */
 async function webengageFireEvent({ userId, eventName, eventData }) {
-  // FIX: Using the .in endpoint for Indian data centers
-  const url = `https://api.in.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
+  // Switched back to Global endpoint (where you previously got Status 201)
+  const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE.trim()}/events`;
   
   const payload = {
     userId: String(userId),
@@ -55,23 +46,25 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
     eventData
   };
 
-  console.log(`[WebEngage Outgoing] Target: .in API | User: ${userId} | Event: ${eventName}`);
+  // DEBUG: Check credentials in logs (only first 4 chars for safety)
+  const keySnippet = WEBENGAGE_API_KEY ? WEBENGAGE_API_KEY.trim().substring(0, 4) : "MISSING";
+  console.log(`[WE Auth Check] Key: ${keySnippet}*** | User: ${userId} | URL: ${url}`);
 
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${WEBENGAGE_API_KEY}`,
+        "Authorization": `Bearer ${WEBENGAGE_API_KEY.trim()}`,
       },
       body: JSON.stringify(payload),
     });
 
     const body = await res.text();
-    console.log(`[WebEngage Response] Status: ${res.status} | Body: ${body}`);
+    console.log(`[WE Response] Status: ${res.status} | Body: ${body}`);
     return res.ok;
   } catch (err) {
-    console.error(`[WebEngage Error] ${eventName}: ${err.message}`);
+    console.error(`[WE Network Error]: ${err.message}`);
     return false;
   }
 }
@@ -81,23 +74,19 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
  */
 async function telegramCreateInviteLink(channelId, name) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createChatInviteLink`;
-  const expireDate = getUnixTimeSeconds() + (48 * 60 * 60);
-
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: channelId,
       member_limit: 1, 
-      expire_date: expireDate,
+      expire_date: getUnixTimeSeconds() + (48 * 60 * 60),
       name: String(name || "").slice(0, 255),
     }),
   });
 
   const data = await res.json();
-  if (!res.ok || !data.ok || !data.result?.invite_link) {
-    throw new Error(`Telegram Error: ${JSON.stringify(data)}`);
-  }
+  if (!data.ok) throw new Error(`TG Error: ${JSON.stringify(data)}`);
   return data.result.invite_link;
 }
 
@@ -111,52 +100,34 @@ app.get("/healthz", (_, res) => res.status(200).send("ok"));
 app.post("/create-invite", async (req, res) => {
   try {
     const apiKey = req.header("x-api-key");
-    if (!apiKey || apiKey !== STORE_API_KEY) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
+    if (apiKey !== STORE_API_KEY) return res.status(401).send("Unauthorized");
 
     const { userId, transactionId } = req.body;
-    if (!userId || !transactionId) {
-      return res.status(400).json({ ok: false, error: "Missing userId or transactionId" });
-    }
+    if (!userId || !transactionId) return res.status(400).send("Missing data");
 
     const txnRef = db.collection(COL_TXN).doc(transactionId);
-    const txnSnap = await txnRef.get();
     
-    let inviteLink;
-    let reused = false;
+    // Create Link
+    const inviteLink = await telegramCreateInviteLink(TELEGRAM_CHANNEL_ID, `TB|${userId}`);
+    const invHash = hashInviteLink(inviteLink);
 
-    if (txnSnap.exists && txnSnap.data()?.inviteLink) {
-      inviteLink = txnSnap.data().inviteLink;
-      reused = true;
-    } else {
-      const linkName = `TB|txn:${transactionId}|uid:${userId}`.slice(0, 255);
-      inviteLink = await telegramCreateInviteLink(TELEGRAM_CHANNEL_ID, linkName);
-      const invHash = hashInviteLink(inviteLink);
+    // Store in DB
+    await db.batch()
+      .set(txnRef, { userId, transactionId, inviteLink, inviteHash: invHash, joined: false })
+      .set(db.collection(COL_INV).doc(invHash), { transactionId, userId, inviteLink })
+      .commit();
 
-      const batch = db.batch();
-      batch.set(txnRef, {
-        userId, transactionId, inviteLink, inviteHash: invHash,
-        createdAt: nowIso(), joined: false
-      }, { merge: true });
-      
-      batch.set(db.collection(COL_INV).doc(invHash), {
-        transactionId, userId, inviteLink, createdAt: nowIso(),
-      }, { merge: true });
-
-      await batch.commit();
-    }
-
+    // Fire WebEngage
     await webengageFireEvent({
       userId,
       eventName: "pass_paid_community_telegram_link_created",
-      eventData: { transactionId, inviteLink, reused }
+      eventData: { transactionId, inviteLink }
     });
 
-    res.json({ ok: true, inviteLink, reused });
+    res.json({ ok: true, inviteLink });
   } catch (err) {
-    console.error(`[Error] /create-invite: ${err.message}`);
-    res.status(500).json({ ok: false, error: err.message });
+    console.error(`[Endpoint Error]: ${err.message}`);
+    res.status(500).send(err.message);
   }
 });
 
@@ -180,12 +151,7 @@ app.post("/telegram-webhook", async (req, res) => {
     const invHash = hashInviteLink(inviteLink);
     const invSnap = await db.collection(COL_INV).doc(invHash).get();
 
-    if (!invSnap.exists) {
-      await db.collection(COL_ORPHAN).doc(`${invHash}_${Date.now()}`).set({
-        inviteLink, telegramUserId, receivedAt: nowIso(), reason: "Link not found"
-      });
-      return res.send("orphan stored");
-    }
+    if (!invSnap.exists) return res.send("link not found");
 
     const { transactionId, userId } = invSnap.data();
     const txnRef = db.collection(COL_TXN).doc(transactionId);
@@ -194,11 +160,11 @@ app.post("/telegram-webhook", async (req, res) => {
     await db.runTransaction(async (t) => {
       const snap = await t.get(txnRef);
       if (!snap.exists || snap.data().joined) return;
-      t.update(txnRef, { joined: true, telegramUserId, joinedAt: nowIso() });
+      t.update(txnRef, { joined: true, telegramUserId, joinedAt: new Date().toISOString() });
       shouldFire = true;
     });
 
-    if (shouldFire && SHOULD_FIRE_JOIN_EVENT) {
+    if (shouldFire) {
       await webengageFireEvent({
         userId,
         eventName: "pass_paid_community_telegram_joined",
@@ -208,12 +174,11 @@ app.post("/telegram-webhook", async (req, res) => {
 
     res.send("ok");
   } catch (err) {
-    console.error(`[Webhook Error] ${err.message}`);
-    res.status(200).send("error logged");
+    console.error(`[Webhook Error]: ${err.message}`);
+    res.status(200).send("logged");
   }
 });
 
-// Bind to 0.0.0.0 for Cloud Run
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Bridge Online on port ${PORT}`);
 });
