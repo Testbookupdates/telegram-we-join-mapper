@@ -37,20 +37,21 @@ const COL_ORPHAN = "orphan_joins";
 
 // Helpers
 const nowIso = () => new Date().toISOString();
+// FIX: WebEngage Events API requires eventTime in UNIX seconds (integer)
+const getUnixTime = () => Math.floor(Date.now() / 1000);
 
 function hashInviteLink(inviteLink) {
   return crypto.createHash("sha256").update(String(inviteLink || "")).digest("hex");
 }
 
 // --- WebEngage API ---
-// FIX: Enhanced logging and forced String userId to prevent silent drops
 async function webengageFireEvent({ userId, eventName, eventData }) {
   const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
   
   const payload = {
-    userId: String(userId), // CRITICAL: WE requires string ID
+    userId: String(userId),      // Force String to prevent silent drops
     eventName,
-    eventTime: nowIso(),
+    eventTime: getUnixTime(),    // FIX: Mandatory UNIX timestamp in seconds
     eventData
   };
 
@@ -80,8 +81,6 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
 // --- Telegram API ---
 async function telegramCreateInviteLink(channelId, name) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createChatInviteLink`;
-  
-  // Set link to expire in 48 hours for security
   const expireDate = Math.floor(Date.now() / 1000) + (48 * 60 * 60);
 
   const res = await fetch(url, {
@@ -108,7 +107,6 @@ app.get("/healthz", (_, res) => res.status(200).send("ok"));
 
 /**
  * 1) CREATE INVITE
- * Now fires 'pass_paid_community_telegram_link_created' directly
  */
 app.post("/create-invite", async (req, res) => {
   try {
@@ -161,7 +159,6 @@ app.post("/create-invite", async (req, res) => {
     res.json({ ok: true, inviteLink, reused });
   } catch (err) {
     console.error(`[Error] /create-invite: ${err.message}`);
-    // FIX: ok: false so Journey can handle the error path
     res.status(500).json({ ok: false, error: err.message });
   }
 });
