@@ -1,143 +1,88 @@
-/* =======================================================
- * Telegram → Firestore → WebEngage Join Mapper
- * Cloud Run | Node.js 18+
- * ======================================================= */
-
-"use strict";
-
 const express = require("express");
 const crypto = require("crypto");
 const { Firestore } = require("@google-cloud/firestore");
 
-// -------------------------------------------------------
-// App setup
-// -------------------------------------------------------
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// -------------------------------------------------------
-// Environment variables
-// -------------------------------------------------------
-const {
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHANNEL_ID,
-  WEBENGAGE_LICENSE_CODE,
-  WEBENGAGE_API_KEY,
-  STORE_API_KEY,
-  FIRE_JOIN_EVENT = "true",
-  PORT = 8080,
-} = process.env;
+// ============= ENV VARS =============
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN; // required
+const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID; // required (single channel)
+const WEBENGAGE_LICENSE_CODE = process.env.WEBENGAGE_LICENSE_CODE; // required
+const WEBENGAGE_API_KEY = process.env.WEBENGAGE_API_KEY; // required (Bearer token value only)
+const STORE_API_KEY = process.env.STORE_API_KEY; // required (x-api-key)
+const FIRE_JOIN_EVENT = (process.env.FIRE_JOIN_EVENT || "true").toLowerCase() === "true"; // safety toggle
 
-const SHOULD_FIRE_JOIN_EVENT = FIRE_JOIN_EVENT.toLowerCase() === "true";
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID || !WEBENGAGE_LICENSE_CODE || !WEBENGAGE_API_KEY || !STORE_API_KEY) {
+  console.error("Missing required env vars. Check TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, WEBENGAGE_LICENSE_CODE, WEBENGAGE_API_KEY, STORE_API_KEY");
+}
 
-// -------------------------------------------------------
-// Startup validation
-// -------------------------------------------------------
-console.log("🚀 Starting telegram-we-join-mapper");
-
-[
-  "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_CHANNEL_ID",
-  "WEBENGAGE_LICENSE_CODE",
-  "WEBENGAGE_API_KEY",
-  "STORE_API_KEY",
-].forEach((key) => {
-  if (!process.env[key]) {
-    console.error(`❌ Missing ENV: ${key}`);
-  } else {
-    console.log(`✅ ENV loaded: ${key}`);
-  }
-});
-
-// -------------------------------------------------------
-// Firestore
-// -------------------------------------------------------
 const db = new Firestore();
 
-const COL_TXN = "txn_invites";
-const COL_INV = "invite_lookup";
-const COL_ORPHAN = "orphan_joins";
+// Collections
+const COL_TXN = "txn_invites";        // docId = transactionId
+const COL_INV = "invite_lookup";      // docId = hash(inviteLink)
 
-// -------------------------------------------------------
 // Helpers
-// -------------------------------------------------------
-const nowIso = () => new Date().toISOString();
+function nowIso() { return new Date().toISOString(); }
 
-const hashInviteLink = (link) =>
-  crypto.createHash("sha256").update(String(link)).digest("hex");
-
-// -------------------------------------------------------
-// Telegram API
-// -------------------------------------------------------
-async function createTelegramInviteLink(channelId, name) {
-  console.log("📨 Creating Telegram invite");
-
-  const res = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createChatInviteLink`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: channelId,
-        member_limit: 1,
-        name: name.slice(0, 255),
-      }),
-    }
-  );
-
-  const data = await res.json();
-
-  if (!res.ok || !data.ok || !data.result?.invite_link) {
-    console.error("❌ Telegram API error:", data);
-    throw new Error("Failed to create Telegram invite");
-  }
-
-  return data.result.invite_link;
+function hashInviteLink(inviteLink) {
+  return crypto.createHash("sha256").update(String(inviteLink || "")).digest("hex");
 }
 
-// -------------------------------------------------------
-// WebEngage
-// -------------------------------------------------------
-async function fireWebEngageEvent({ userId, eventName, eventData }) {
-  console.log("📊 WebEngage event:", eventName, userId);
+async function telegramCreateInviteLink(channelId, name) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createChatInviteLink`;
+  const payload = {
+    chat_id: channelId,
+    member_limit: 1,
+    name: String(name || "").slice(0, 255),
+  };
 
-  const res = await fetch(
-    `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${WEBENGAGE_API_KEY}`,
-      },
-      body: JSON.stringify({ userId, eventName, eventData }),
-    }
-  );
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 
-  if (!res.ok) {
-    const errorText = await res.text();
-    console.error("❌ WebEngage error:", errorText);
-    throw new Error("WebEngage event failed");
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok || !json.ok || !json.result?.invite_link) {
+    throw new Error(`Telegram createChatInviteLink failed: http=${resp.status} body=${JSON.stringify(json).slice(0, 800)}`);
   }
+  return json.result.invite_link;
 }
 
-// -------------------------------------------------------
-// Health checks
-// -------------------------------------------------------
+async function webengageFireEvent({ userId, eventName, eventData }) {
+  const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "Authorization": `Bearer ${WEBENGAGE_API_KEY}`,
+    },
+    body: JSON.stringify({ userId, eventName, eventData }),
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`WebEngage event failed: http=${resp.status} body=${text.slice(0, 800)}`);
+  }
+  return true;
+}
+
+// ======================
+// Health
+// ======================
 app.get("/healthz", (_, res) => res.status(200).send("ok"));
 
-app.get("/telegram-webhook", (_, res) =>
-  res.status(200).send("telegram webhook alive")
-);
-
-// -------------------------------------------------------
-// CREATE INVITE (secured endpoint)
-// -------------------------------------------------------
+// ======================
+// 1) Create invite (called by WebEngage Call API block)
+// ======================
 app.post("/create-invite", async (req, res) => {
-  console.log("➡️ /create-invite");
-
   try {
-    if (req.header("x-api-key") !== STORE_API_KEY) {
-      console.warn("⛔ Unauthorized request");
+    // Protect endpoint
+    const apiKey = req.header("x-api-key");
+    if (!apiKey || apiKey !== STORE_API_KEY) {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
 
@@ -145,140 +90,156 @@ app.post("/create-invite", async (req, res) => {
     const transactionId = String(req.body?.transactionId || "").trim();
 
     if (!userId || !transactionId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing userId or transactionId",
-      });
+      return res.status(400).json({ ok: false, error: "Missing userId or transactionId" });
     }
 
+    // Idempotency: if we already created for this txn, return existing
     const txnRef = db.collection(COL_TXN).doc(transactionId);
-    const txnSnap = await txnRef.get();
-
-    if (txnSnap.exists && txnSnap.data()?.inviteLink) {
-      console.log("♻️ Reusing invite");
-      return res.json({
-        ok: true,
-        inviteLink: txnSnap.data().inviteLink,
-        reused: true,
-      });
+    const existing = await txnRef.get();
+    if (existing.exists) {
+      const data = existing.data() || {};
+      if (data.inviteLink) {
+        return res.json({ ok: true, inviteLink: data.inviteLink, reused: true });
+      }
     }
 
-    const inviteName = `txn:${transactionId}|uid:${userId}|${Date.now()}`;
-    const inviteLink = await createTelegramInviteLink(
-      TELEGRAM_CHANNEL_ID,
-      inviteName
-    );
+    const linkName = `TB|txn:${transactionId}|uid:${userId}|t:${Date.now()}`.slice(0, 255);
+    const inviteLink = await telegramCreateInviteLink(TELEGRAM_CHANNEL_ID, linkName);
 
-    const inviteHash = hashInviteLink(inviteLink);
+    const invHash = hashInviteLink(inviteLink);
 
+    // Write mapping (txn -> invite)
     await txnRef.set({
       userId,
       transactionId,
       inviteLink,
-      inviteHash,
-      joined: false,
+      inviteHash: invHash,
       createdAt: nowIso(),
-    });
+      joined: false,
+      telegramUserId: "",
+      joinedAt: ""
+    }, { merge: true });
 
-    await db.collection(COL_INV).doc(inviteHash).set({
-      inviteHash,
+    // Reverse mapping (invite -> txn)
+    await db.collection(COL_INV).doc(invHash).set({
       inviteLink,
+      inviteHash: invHash,
       transactionId,
       userId,
-      createdAt: nowIso(),
-    });
+      createdAt: nowIso()
+    }, { merge: true });
 
-    console.log("✅ Invite created & stored");
-    res.json({ ok: true, inviteLink, reused: false });
-  } catch (err) {
-    console.error("❌ create-invite error:", err);
-    res.status(500).json({ ok: false, error: err.message });
+    return res.json({ ok: true, inviteLink, reused: false });
+  } catch (e) {
+    console.error("create-invite error:", e);
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// -------------------------------------------------------
-// TELEGRAM WEBHOOK
-// -------------------------------------------------------
+// ======================
+// 2) Telegram webhook (stores only relevant join updates; discards rest)
+// ======================
 app.post("/telegram-webhook", async (req, res) => {
-  console.log("📥 Telegram webhook received");
-
   try {
-    const payload =
-      req.body?.chat_member ||
-      req.body?.my_chat_member ||
-      req.body;
+    const body = req.body || {};
 
-    const chatId = String(payload?.chat?.id || "");
-    const status = payload?.new_chat_member?.status;
-    const telegramUserId = String(payload?.new_chat_member?.user?.id || "");
-    const inviteLink = payload?.invite_link?.invite_link;
+    // Normalize update shape
+    let upd = null;
+    if (body.chat_member) upd = body.chat_member;
+    else if (body.my_chat_member) upd = body.my_chat_member;
+    else upd = body; // fallback (some forward inner object)
 
-    if (
-      chatId !== TELEGRAM_CHANNEL_ID ||
-      !["member", "administrator", "creator"].includes(status)
-    ) {
-      return res.send("ignored");
+    const chatId = String(upd?.chat?.id || "").trim();
+    const newStatus = String(upd?.new_chat_member?.status || "").trim();
+    const telegramUserId = String(upd?.new_chat_member?.user?.id || "").trim();
+    const inviteLink = String(upd?.invite_link?.invite_link || "").trim();
+
+    // We only care about JOIN-like statuses
+    const isJoinLike = (newStatus === "member" || newStatus === "administrator" || newStatus === "creator");
+
+    // Single channel only
+    if (chatId && chatId !== String(TELEGRAM_CHANNEL_ID)) {
+      return res.status(200).send("ignored: other channel");
     }
 
+    // If not join-like, discard fast (keeps webhook storage low)
+    if (!isJoinLike) {
+      return res.status(200).send("ignored: not a join");
+    }
+
+    // If join-like but missing inviteLink or telegramUserId, still store minimal “orphan”
     if (!inviteLink || !telegramUserId) {
-      return res.send("ignored");
+      console.warn("Join-like but missing fields", { chatId, hasInviteLink: !!inviteLink, telegramUserId });
+      return res.status(200).send("ok: missing fields");
     }
 
-    const inviteHash = hashInviteLink(inviteLink);
-    const invRef = db.collection(COL_INV).doc(inviteHash);
+    const invHash = hashInviteLink(inviteLink);
+
+    // Find mapping
+    const invRef = db.collection(COL_INV).doc(invHash);
     const invSnap = await invRef.get();
 
     if (!invSnap.exists) {
-      console.warn("⚠️ Orphan join detected");
-      await db.collection(COL_ORPHAN).add({
+      // Orphan webhook: store it (as you asked), but no WE fire possible yet
+      await db.collection("orphan_joins").doc(`${invHash}_${Date.now()}`).set({
         inviteLink,
+        inviteHash: invHash,
+        chatId,
         telegramUserId,
         receivedAt: nowIso(),
+        reason: "Invite not found in DB"
       });
-      return res.send("orphan stored");
+      return res.status(200).send("ok: orphan stored");
     }
 
-    const { transactionId, userId } = invSnap.data();
+    const invData = invSnap.data() || {};
+    const transactionId = String(invData.transactionId || "").trim();
+    const userId = String(invData.userId || "").trim();
+
+    if (!transactionId || !userId) {
+      return res.status(200).send("ok: mapping incomplete");
+    }
+
     const txnRef = db.collection(COL_TXN).doc(transactionId);
 
-    let shouldFire = false;
-
+    // Transactional update + idempotency guard
     await db.runTransaction(async (t) => {
-      const snap = await t.get(txnRef);
-      if (snap.exists && snap.data().joined) return;
+      const txnSnap = await t.get(txnRef);
+      const txn = txnSnap.exists ? (txnSnap.data() || {}) : {};
 
-      t.set(
-        txnRef,
-        {
-          joined: true,
-          telegramUserId,
-          joinedAt: nowIso(),
-        },
-        { merge: true }
-      );
+      if (txn.joined === true) {
+        // already processed
+        return;
+      }
 
-      shouldFire = true;
+      t.set(txnRef, {
+        joined: true,
+        telegramUserId,
+        joinedAt: nowIso()
+      }, { merge: true });
     });
 
-    if (shouldFire && SHOULD_FIRE_JOIN_EVENT) {
-      await fireWebEngageEvent({
+    // Fire WebEngage joined event (only once per txn)
+    if (FIRE_JOIN_EVENT) {
+      await webengageFireEvent({
         userId,
         eventName: "pass_paid_community_telegram_joined",
-        eventData: { transactionId, telegramUserId },
+        eventData: {
+          transactionId,
+          inviteLink,
+          telegramUserId
+        }
       });
     }
 
-    console.log("✅ Join processed");
-    res.send("ok");
-  } catch (err) {
-    console.error("❌ Webhook error:", err);
-    res.send("error logged");
+    return res.status(200).send("ok: join processed");
+  } catch (e) {
+    console.error("telegram-webhook error:", e);
+    // Always 200 to Telegram to avoid retries storm; log internally
+    return res.status(200).send("ok: error logged");
   }
 });
 
-// -------------------------------------------------------
-// Server start
-// -------------------------------------------------------
-app.listen(PORT, () =>
-  console.log(`🚀 Server listening on port ${PORT}`)
-);
+// Cloud Run port
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Listening on ${PORT}`));
