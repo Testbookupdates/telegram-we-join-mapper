@@ -26,6 +26,7 @@ const SHOULD_FIRE_JOIN_EVENT = FIRE_JOIN_EVENT.toLowerCase() === "true";
 
 const db = new Firestore();
 
+// Firestore Collection Names
 const COL_TXN = "txn_invites";    
 const COL_INV = "invite_lookup";  
 const COL_ORPHAN = "orphan_joins"; 
@@ -41,12 +42,11 @@ function hashInviteLink(inviteLink) {
 // ============= EXTERNAL APIS =============
 
 /**
- * Sends custom events to WebEngage
+ * Sends custom events to WebEngage (India Region Endpoint)
  */
 async function webengageFireEvent({ userId, eventName, eventData }) {
-  // Try the global endpoint first. If your dashboard is dashboard.in.webengage.com,
-  // change this URL to: https://api.in.webengage.com/v1/accounts/...
-  const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
+  // FIX: Using the .in endpoint for Indian data centers
+  const url = `https://api.in.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
   
   const payload = {
     userId: String(userId),
@@ -55,7 +55,7 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
     eventData
   };
 
-  console.log(`[WebEngage Payload Check] Sending for User: ${userId} | Event: ${eventName}`);
+  console.log(`[WebEngage Outgoing] Target: .in API | User: ${userId} | Event: ${eventName}`);
 
   try {
     const res = await fetch(url, {
@@ -105,6 +105,9 @@ async function telegramCreateInviteLink(channelId, name) {
 
 app.get("/healthz", (_, res) => res.status(200).send("ok"));
 
+/**
+ * 1. POST /create-invite
+ */
 app.post("/create-invite", async (req, res) => {
   try {
     const apiKey = req.header("x-api-key");
@@ -157,6 +160,9 @@ app.post("/create-invite", async (req, res) => {
   }
 });
 
+/**
+ * 2. POST /telegram-webhook
+ */
 app.post("/telegram-webhook", async (req, res) => {
   try {
     const body = req.body || {};
@@ -207,6 +213,7 @@ app.post("/telegram-webhook", async (req, res) => {
   }
 });
 
+// Bind to 0.0.0.0 for Cloud Run
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Bridge Online on port ${PORT}`);
 });
