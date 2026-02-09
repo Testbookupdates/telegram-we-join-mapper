@@ -4,7 +4,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { Firestore } = require("@google-cloud/firestore");
 
-// FIX: Explicitly handle fetch for Node runtimes that don't have it globally
+// FIX: Explicitly handle fetch for Node runtimes that don't have it globally (like Cloud Run)
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
@@ -35,10 +35,15 @@ const COL_TXN = "txn_invites";    // docId = transactionId
 const COL_INV = "invite_lookup";  // docId = hash(inviteLink)
 const COL_ORPHAN = "orphan_joins"; 
 
-// Helpers
+// --- Helpers ---
+
 const nowIso = () => new Date().toISOString();
-// FIX: WebEngage Events API requires eventTime in UNIX seconds (integer)
-const getUnixTime = () => Math.floor(Date.now() / 1000);
+
+/**
+ * WebEngage Events API requires eventTime in UNIX seconds (integer).
+ * Using milliseconds or ISO strings causes a 400 error.
+ */
+const getUnixTimeSeconds = () => Math.floor(Date.now() / 1000);
 
 function hashInviteLink(inviteLink) {
   return crypto.createHash("sha256").update(String(inviteLink || "")).digest("hex");
@@ -46,12 +51,13 @@ function hashInviteLink(inviteLink) {
 
 // --- WebEngage API ---
 async function webengageFireEvent({ userId, eventName, eventData }) {
+  // NOTE: Use api.in.webengage.com if your account is in the India region
   const url = `https://api.webengage.com/v1/accounts/${WEBENGAGE_LICENSE_CODE}/events`;
   
   const payload = {
-    userId: String(userId),      // Force String to prevent silent drops
+    userId: String(userId),      // CRITICAL: WebEngage requires string IDs
     eventName,
-    eventTime: getUnixTime(),    // FIX: Mandatory UNIX timestamp in seconds
+    eventTime: getUnixTimeSeconds(), // FIX: Mandatory UNIX timestamp in seconds
     eventData
   };
 
@@ -81,7 +87,7 @@ async function webengageFireEvent({ userId, eventName, eventData }) {
 // --- Telegram API ---
 async function telegramCreateInviteLink(channelId, name) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createChatInviteLink`;
-  const expireDate = Math.floor(Date.now() / 1000) + (48 * 60 * 60);
+  const expireDate = Math.floor(Date.now() / 1000) + (48 * 60 * 60); // 48-hour validity
 
   const res = await fetch(url, {
     method: "POST",
@@ -96,7 +102,7 @@ async function telegramCreateInviteLink(channelId, name) {
 
   const data = await res.json();
   if (!res.ok || !data.ok || !data.result?.invite_link) {
-    throw new Error(`Telegram Error: ${JSON.stringify(data)}`);
+    throw new Error(`Telegram API Error: ${JSON.stringify(data)}`);
   }
   return data.result.invite_link;
 }
@@ -107,6 +113,7 @@ app.get("/healthz", (_, res) => res.status(200).send("ok"));
 
 /**
  * 1) CREATE INVITE
+ * Called by WebEngage Journey. Generates link and fires "link_created" event.
  */
 app.post("/create-invite", async (req, res) => {
   try {
@@ -128,6 +135,7 @@ app.post("/create-invite", async (req, res) => {
     let inviteLink;
     let reused = false;
 
+    // Idempotency: Reuse link if it already exists for this transaction
     if (txnSnap.exists && txnSnap.data()?.inviteLink) {
       inviteLink = txnSnap.data().inviteLink;
       reused = true;
@@ -149,7 +157,7 @@ app.post("/create-invite", async (req, res) => {
       await batch.commit();
     }
 
-    // FIRE LINK CREATED EVENT
+    // FIRE LINK_CREATED EVENT
     await webengageFireEvent({
       userId,
       eventName: "pass_paid_community_telegram_link_created",
@@ -165,6 +173,7 @@ app.post("/create-invite", async (req, res) => {
 
 /**
  * 2) TELEGRAM WEBHOOK
+ * Called by Telegram when user joins. Matches link and fires "joined" event.
  */
 app.post("/telegram-webhook", async (req, res) => {
   try {
@@ -176,18 +185,19 @@ app.post("/telegram-webhook", async (req, res) => {
     const telegramUserId = String(upd?.new_chat_member?.user?.id || "").trim();
     const inviteLink = String(upd?.invite_link?.invite_link || "").trim();
 
-    if (!["member", "administrator", "creator"].includes(newStatus)) return res.send("ignored");
-    if (chatId !== String(TELEGRAM_CHANNEL_ID)) return res.send("wrong channel");
-    if (!inviteLink) return res.send("no link");
+    // Filter for valid joins in the specified channel
+    if (!["member", "administrator", "creator"].includes(newStatus)) return res.send("ignored: not a join");
+    if (chatId !== String(TELEGRAM_CHANNEL_ID)) return res.send("ignored: wrong channel");
+    if (!inviteLink) return res.send("ignored: no link used");
 
     const invHash = hashInviteLink(inviteLink);
     const invSnap = await db.collection(COL_INV).doc(invHash).get();
 
     if (!invSnap.exists) {
       await db.collection(COL_ORPHAN).doc(`${invHash}_${Date.now()}`).set({
-        inviteLink, inviteHash: invHash, telegramUserId, receivedAt: nowIso(), reason: "Not in DB"
+        inviteLink, inviteHash: invHash, telegramUserId, receivedAt: nowIso(), reason: "Link not found in database"
       });
-      return res.send("orphan stored");
+      return res.send("ok: orphan join stored");
     }
 
     const { transactionId, userId } = invSnap.data();
@@ -197,7 +207,12 @@ app.post("/telegram-webhook", async (req, res) => {
     await db.runTransaction(async (t) => {
       const snap = await t.get(txnRef);
       if (!snap.exists || snap.data().joined) return;
-      t.update(txnRef, { joined: true, telegramUserId, joinedAt: nowIso() });
+      
+      t.update(txnRef, { 
+        joined: true, 
+        telegramUserId, 
+        joinedAt: nowIso() 
+      });
       shouldFire = true;
     });
 
@@ -209,10 +224,11 @@ app.post("/telegram-webhook", async (req, res) => {
       });
     }
 
-    res.send("ok");
+    res.send("ok: join processed");
   } catch (err) {
     console.error(`[Webhook Error] ${err.message}`);
-    res.status(200).send("error logged"); 
+    // Respond 200 to Telegram to prevent retry loops on internal errors
+    res.status(200).send("ok: error logged internally"); 
   }
 });
 
