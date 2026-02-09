@@ -1,0 +1,17 @@
+{
+  "name": "telegram-we-join-mapper",
+  "version": "1.0.0",
+  "description": "Maps Telegram invite joins to WebEngage events using Cloud Run + Firestore",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.11.0",
+    "express": "^4.19.2"
+  }
+}
